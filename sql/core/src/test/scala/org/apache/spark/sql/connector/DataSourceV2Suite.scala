@@ -22,7 +22,6 @@ import java.util
 import java.util.OptionalLong
 
 import scala.collection.JavaConverters._
-
 import test.org.apache.spark.sql.connector._
 
 import org.apache.spark.SparkException
@@ -31,7 +30,9 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.connector.catalog.{SupportsRead, Table, TableCapability, TableProvider}
 import org.apache.spark.sql.connector.catalog.TableCapability._
 import org.apache.spark.sql.connector.read._
+import org.apache.spark.sql.connector.read.ordering.SortOrder
 import org.apache.spark.sql.connector.read.partitioning.{ClusteredDistribution, Distribution, Partitioning}
+import org.apache.spark.sql.execution.SortExec
 import org.apache.spark.sql.execution.datasources.v2.{BatchScanExec, DataSourceV2Relation, DataSourceV2ScanRelation}
 import org.apache.spark.sql.execution.exchange.{Exchange, ShuffleExchangeExec}
 import org.apache.spark.sql.execution.vectorized.OnHeapColumnVector
@@ -185,6 +186,24 @@ class DataSourceV2Suite extends QueryTest with SharedSparkSession {
         assert(groupByAPlusB.queryExecution.executedPlan.collectFirst {
           case e: ShuffleExchangeExec => e
         }.isDefined)
+      }
+    }
+  }
+
+  test("sort ordering") {
+    import org.apache.spark.sql.functions.{count, sum}
+    Seq(
+      classOf[SortAwareDataSource]
+    ).foreach { cls =>
+      withClue(cls.getName) {
+        val df = spark.read.format(cls.getName).load()
+        checkAnswer(df, Seq(Row(1, 4), Row(1, 4), Row(3, 6), Row(2, 6), Row(4, 2), Row(4, 2)))
+
+        val sorted = df.order
+        assert(sorted.queryExecution.executedPlan.collect {
+          case e: SortExec => e
+        }.size = 0)
+
       }
     }
   }
@@ -650,7 +669,7 @@ object ColumnarReaderFactory extends PartitionReaderFactory {
 class PartitionAwareDataSource extends TableProvider {
 
   class MyScanBuilder extends SimpleScanBuilder
-    with SupportsReportPartitioning{
+    with SupportsReportPartitioning {
 
     override def planInputPartitions(): Array[InputPartition] = {
       // Note that we don't have same value of column `a` across partitions.
@@ -664,6 +683,46 @@ class PartitionAwareDataSource extends TableProvider {
     }
 
     override def outputPartitioning(): Partitioning = new MyPartitioning
+  }
+
+  override def getTable(options: CaseInsensitiveStringMap): Table = new SimpleBatchTable {
+    override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
+      new MyScanBuilder()
+    }
+  }
+
+  class MyPartitioning extends Partitioning {
+    override def numPartitions(): Int = 2
+
+    override def satisfy(distribution: Distribution): Boolean = distribution match {
+      case c: ClusteredDistribution => c.clusteredColumns.contains("i")
+      case _ => false
+    }
+  }
+}
+
+class SortAwareDataSource extends TableProvider {
+
+  class MyScanBuilder extends SimpleScanBuilder
+    with SupportsReadOrdering {
+
+    override def planInputPartitions(): Array[InputPartition] = {
+      // Note that we don't have same value of column `a` across partitions.
+      Array(
+        SpecificInputPartition(Array(1, 1, 3), Array(4, 4, 6)),
+        SpecificInputPartition(Array(2, 4, 4), Array(6, 2, 2)))
+    }
+
+    override def createReaderFactory(): PartitionReaderFactory = {
+      SpecificReaderFactory
+    }
+
+    /**
+     * Returns the output data partitioning that this reader guarantees.
+     */
+    override def outputOrdering(): util.List[SortOrder] = List(
+      new SortOrder("i",SortOrder.DefaultSMJSortDirection,SortOrder.DefaultSMJNullOrdering)
+    )
   }
 
   override def getTable(options: CaseInsensitiveStringMap): Table = new SimpleBatchTable {
